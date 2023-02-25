@@ -12,10 +12,13 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
 #include "clang/AST/AST.h"
 #include "clang/AST/ASTConsumer.h"
+#include "clang/AST/Mangle.h"
 #include "clang/AST/RecursiveASTVisitor.h"
+#include "llvm/Support/FileSystem.h"
 
 #include <vector>
 #include <set>
@@ -23,6 +26,7 @@
 using namespace clang;
 
 #define PLUGIN_NAME "FindInternalCandidates"
+#define DB "/home/yugr/internal.db"
 
 namespace {
 
@@ -35,6 +39,16 @@ std::string getDeclName(const NamedDecl *D) {
   llvm::raw_string_ostream OS(S);
   D->printQualifiedName(OS);
   return S;
+}
+
+std::string getMainFileName(ASTContext &Ctx) {
+  auto &SrcMgr = Ctx.getSourceManager();
+  const FileEntry* Entry = SrcMgr.getFileEntryForID(SrcMgr.getMainFileID());
+
+  SmallString<128> FilenameBuf = Entry->getName();
+  llvm::sys::fs::make_absolute(FilenameBuf);
+
+  return std::string(FilenameBuf.data(), FilenameBuf.size());
 }
 
 using CallGraph = std::map<const CXXMethodDecl *, std::set<const CXXMethodDecl *>>;
@@ -77,7 +91,11 @@ CallGraph buildCallGraph(const CXXRecordDecl *D) {
 }
 
 class FindInternalCandidatesConsumer : public ASTConsumer {
-  void CollectInternalMethods(const CXXRecordDecl *D) {
+  DiagnosticsEngine &DE;
+  MangleContext *Mangler;
+  std::string FileName;
+
+  void CollectInternalMethods(const CXXRecordDecl *D, ASTContext &Ctx) {
     // Do not try to optimize std::
 
     if (D->isInStdNamespace())
@@ -232,11 +250,50 @@ class FindInternalCandidatesConsumer : public ASTConsumer {
       }
     }
 
-    // TODO
+    std::string Out;
+
+    {
+      llvm::raw_string_ostream OS(Out);
+      OS << FileName;
+      for (auto *D : ExternallyUnreachablePrivates) {
+        auto MangledName = mangle(D);
+        OS << " " << MangledName;
+      }
+      OS << "\n";
+    }
+
+    std::error_code EC;
+    llvm::raw_fd_ostream OS(DB, EC, llvm::sys::fs::OF_Append);
+    if (EC) {
+      llvm::errs() << "Failed to open database " << DB << " for writing\n";
+      return;
+    }
+
+    OS << Out;
+  }
+
+  std::string mangle(const CXXMethodDecl *D) const {
+    std::string S;
+    llvm::raw_string_ostream OS(S);
+    std::unique_ptr<GlobalDecl> GD;
+    // Xtors need special syntax
+    if (auto *CD = dyn_cast<CXXConstructorDecl>(D))
+      GD = std::make_unique<GlobalDecl>(CD, Ctor_Complete);
+    else if (auto *DD = dyn_cast<CXXDestructorDecl>(D))
+      GD = std::make_unique<GlobalDecl>(DD, Dtor_Complete);
+    else
+      GD = std::make_unique<GlobalDecl>(D);
+    Mangler->mangleName(*GD, OS);
+    return S;
   }
 
 public:
+  FindInternalCandidatesConsumer(DiagnosticsEngine &DE): DE(DE), Mangler(nullptr) {}
+
   void HandleTranslationUnit(ASTContext& Ctx) override {
+    Mangler = ItaniumMangleContext::create(Ctx, DE);
+    FileName = getMainFileName(Ctx);
+
     struct Visitor : public RecursiveASTVisitor<Visitor> {
       std::vector<const CXXRecordDecl *> Classes;
       Visitor() {}
@@ -247,7 +304,10 @@ public:
     } V;
     V.TraverseDecl(Ctx.getTranslationUnitDecl());
     for (auto *FD : V.Classes)
-      CollectInternalMethods(FD);
+      CollectInternalMethods(FD, Ctx);
+
+    delete Mangler;
+    Mangler = nullptr;
   }
 };
 
@@ -255,7 +315,8 @@ class FindInternalCandidatesAction : public PluginASTAction {
 public:
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
                                                  llvm::StringRef) override {
-    return std::make_unique<FindInternalCandidatesConsumer>();
+    DiagnosticsEngine &D = CI.getDiagnostics();
+    return std::make_unique<FindInternalCandidatesConsumer>(D);
   }
 
   bool ParseArgs(const CompilerInstance &CI,
