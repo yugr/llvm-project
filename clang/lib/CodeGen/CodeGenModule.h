@@ -37,6 +37,7 @@
 #include "llvm/IR/ValueHandle.h"
 #include "llvm/Transforms/Utils/SanitizerStats.h"
 #include <optional>
+#include <set>
 
 namespace llvm {
 class Module;
@@ -314,6 +315,7 @@ private:
   std::string ModuleNameHash;
   bool CXX20ModuleInits = false;
   std::unique_ptr<CodeGenTBAA> TBAA;
+  std::set<std::string> Internals;
 
   mutable std::unique_ptr<TargetCodeGenInfo> TheTargetCodeGenInfo;
 

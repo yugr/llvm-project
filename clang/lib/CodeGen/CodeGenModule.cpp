@@ -65,10 +65,12 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ConvertUTF.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/xxhash.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/TargetParser/X86TargetParser.h"
+#include <fstream>
 #include <optional>
 
 using namespace clang;
@@ -77,6 +79,14 @@ using namespace CodeGen;
 static llvm::cl::opt<bool> LimitedCoverage(
     "limited-coverage-experimental", llvm::cl::Hidden,
     llvm::cl::desc("Emit limited coverage mapping information (experimental)"));
+
+static llvm::cl::opt<bool> Internalize(
+    "internalize",
+    llvm::cl::init(false));
+
+static llvm::cl::opt<bool> InternalizeVerbosity(
+    "internalize-verbose",
+    llvm::cl::init(false));
 
 static const char AnnotationSection[] = "llvm.metadata";
 
@@ -210,6 +220,40 @@ CodeGenModule::CodeGenModule(ASTContext &C,
         break;
       }
     ModuleNameHash = llvm::getUniqueInternalLinkagePostfix(Path);
+  }
+
+  // Load internalizable names from database
+
+  std::ifstream S("/home/yugr/internal.db");
+
+  if (!S) {
+    if (InternalizeVerbosity)
+      llvm::errs() << "Failed to open database for reading\n";
+  } else {
+    // TODO: get rid of code dup w/ FindInternalCandidates.cpp
+
+    auto &SrcMgr = C.getSourceManager();
+    const FileEntry* Entry = SrcMgr.getFileEntryForID(SrcMgr.getMainFileID());
+
+    SmallString<128> FilenameBuf = Entry->getName();
+    llvm::sys::fs::make_absolute(FilenameBuf);
+
+    std::string FileName(FilenameBuf.data(), FilenameBuf.size());
+
+    for (std::string Line; std::getline(S, Line); ) {
+      if (Line.rfind(FileName, 0) != 0)
+        continue;
+
+      std::istringstream LineS(Line.substr(FileName.size() + 1));
+      for (std::string Symbol; std::getline(LineS, Symbol, ' '); )
+        Internals.insert(Symbol);
+
+      if (InternalizeVerbosity)
+        for (auto &Symbol : Internals)
+          llvm::errs() << "Read internalizable symbol: " << Symbol << "\n";
+
+      break;
+    }
   }
 }
 
@@ -5399,6 +5443,13 @@ void CodeGenModule::EmitGlobalFunctionDefinition(GlobalDecl GD,
   // declarations).
   auto *Fn = cast<llvm::Function>(GV);
   setFunctionLinkage(GD, Fn);
+
+  auto MangledName = getMangledName(GD);
+  if (Internalize && Internals.count(MangledName.str())) {
+    if (InternalizeVerbosity)
+      llvm::errs() << "Internalizing symbol " << MangledName << "\n";
+    Fn->setLinkage(llvm::GlobalVariable::LinkageTypes::InternalLinkage);
+  }
 
   // FIXME: this is redundant with part of setFunctionDefinitionAttributes
   setGVProperties(Fn, GD);
