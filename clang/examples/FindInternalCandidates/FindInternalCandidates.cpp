@@ -44,13 +44,13 @@ CallGraph buildCallGraph(const CXXRecordDecl *D) {
     std::set<const CXXMethodDecl *> &Callees;
     CallVisitor(std::set<const CXXMethodDecl *> &Callees) : Callees(Callees) {}
     bool VisitCXXMemberCallExpr(CXXMemberCallExpr *E) {
-      Callees.insert(E->getMethodDecl());
+      Callees.insert(E->getMethodDecl()->getCanonicalDecl());
       return true;
     }
     bool VisitCallExpr(CallExpr *E) {
       // Calls to static methods are represented with CallExpr's
       if (auto *D = dyn_cast_or_null<CXXMethodDecl>(E->getCalleeDecl()))
-        Callees.insert(D);
+        Callees.insert(D->getCanonicalDecl());
       return true;
     }
   };
@@ -150,7 +150,7 @@ class FindInternalCandidatesConsumer : public ASTConsumer {
           // Vtables may be emitted outside of class definition
           // TODO: can we do a precise check for this?
           && !M->isVirtual())
-        Candidates.push_back(M);
+        Candidates.push_back(M->getCanonicalDecl());
     }
 
     if (Candidates.empty()) {
@@ -169,8 +169,9 @@ class FindInternalCandidatesConsumer : public ASTConsumer {
 
     std::vector<const CXXMethodDecl *> InlineNonPrivates;
     for (auto *M : Methods) {
-      if (M->getAccess() != AS_private && M->hasInlineBody())
-        InlineNonPrivates.push_back(M);
+      // Only def may be marked as inlined, see MaybeTrackCord in abseil
+      if (M->getAccess() != AS_private && (M->hasInlineBody() || M->getDefinition()->isInlined()))
+        InlineNonPrivates.push_back(M->getCanonicalDecl());
     }
 
     if (V > 1) {
